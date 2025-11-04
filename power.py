@@ -1,4 +1,5 @@
-# 2024-08-21, hannes@duckdblabs.com
+# 2024-08-21, initial version, hannes@duckdblabs.com
+# 2025-06-30, encryption, hannes@duckdblabs.com
 
 import threading
 import duckdb
@@ -12,18 +13,25 @@ import shutil
 import psutil
 import datetime
 
+## config
 scale_factor = 100
+encryption = False
+use_parquet = True
+## should be it
 
 datadir = f'gen/sf{scale_factor}'
 template_db_file = f'{datadir}/tpch_template.duckdb'
 db_file = f'{datadir}/tpch.duckdb'
+
+if encryption:
+	template_db_file = f'{datadir}/tpch_template_encypted.duckdb'
+	db_file = f'{datadir}/tpch_encrypted.duckdb'
 
 # from section 5.3.4 of tpch spec
 scale_factor_streams_map = {1:2, 10: 3, 100:5, 300:6, 1000:7}
 streams = scale_factor_streams_map[scale_factor]
 
 print(f"Scale factor {scale_factor}")
-use_parquet = True
 reader = 'read_csv'
 ext = ''
 if use_parquet:
@@ -33,7 +41,8 @@ if use_parquet:
 else:
 	print("CSV refresh")
 
-logfile = f'log-sf{scale_factor}-{str(datetime.datetime.now(datetime.UTC)).replace(' ','T')}.tsv'
+timestamp = str(datetime.datetime.utcnow()).replace(' ','T').replace(':', '-')
+logfile = f'log-sf{scale_factor}-{timestamp}.tsv'
 proceed = True
 
 def monitor():
@@ -47,24 +56,51 @@ def monitor():
 		'cpu_user',
 		'cpu_system',
 		'memory_rss',
-		'memory_vms'
+		'memory_vms',
+		'read_bytes',
+		'write_bytes'
 		]).encode('utf8') + b'\n')
 	start = time.time()
+
+	disk_info = psutil.disk_io_counters()
+	start_read_bytes = disk_info.read_bytes
+	start_write_bytes = disk_info.write_bytes
+
 	while proceed:
 		cpu_times = proc.cpu_times()
 		memory_info = proc.memory_info()
+		disk_info = psutil.disk_io_counters()
 		log.write('\t'.join(str(x) for x in [
 			round(time.time()-start,2),
 			round(proc.cpu_percent()),
 			round(cpu_times.user,2),
 			round(cpu_times.system,2),
 			memory_info.rss,
-			memory_info.vms
+			memory_info.vms,
+			disk_info.read_bytes - start_read_bytes,
+			disk_info.write_bytes - start_write_bytes
 			]).encode('utf8') + b'\n')
 		time.sleep(1)
 		log.flush()
 
 threading.Thread(target=monitor).start()
+
+def get_connection(db_filename):
+	if encryption:
+		con = duckdb.connect()
+		con.execute('INSTALL httpfs; LOAD httpfs;')
+		con.execute(f"ATTACH '{db_filename}' AS db (ENCRYPTION_KEY 'asdf')")
+		con.execute('USE db')
+	else:
+		con = duckdb.connect(db_filename)
+	con.execute("SET memory_limit='8GB'")
+	return con
+
+def clone_connection(con0):
+	con = con0.cursor()
+	if encryption:
+		con.execute('USE db')
+	return con
 
 # create db template file if not exists
 if os.path.exists(db_file):
@@ -75,7 +111,8 @@ if os.path.exists(wal_file):
 
 if not os.path.exists(template_db_file):
 	print(f"begin loading into {template_db_file}")
-	con = duckdb.connect(template_db_file)
+	con = get_connection(template_db_file)
+
 	schema = pathlib.Path('schema.sql').read_text()
 	con.execute(schema)
 	for t in ['customer', 'lineitem', 'nation', 'orders', 'part', 'partsupp', 'region', 'supplier']:
@@ -89,13 +126,14 @@ else:
 	print(f"cached db from {template_db_file}")
 
 shutil.copyfile(template_db_file, db_file)
-con0 = duckdb.connect(db_file)
+
+con0 = get_connection(db_file)
 con0.execute(f"SET wal_autocheckpoint='{scale_factor}MB'")
 # con0.execute("SET threads='1'")
 
 def query(n):
 	print(f"starting query stream {n}")
-	con = con0.cursor()
+	con = clone_connection(con0)
 	queries = pathlib.Path(f'{datadir}/queries{n}.sql').read_text().split(";")
 	timings = []
 	query_idx = 1
@@ -116,7 +154,7 @@ def query(n):
 	return time_prod
 
 def RF1(n):
-	con = con0.cursor()
+	con = clone_connection(con0)
 	con.begin()
 	lineitem = f"{datadir}/lineitem.tbl.u{n}{ext}"
 	orders = f"{datadir}/orders.tbl.u{n}{ext}"
@@ -127,7 +165,7 @@ def RF1(n):
 
 
 def RF2(n):
-	con = con0.cursor()
+	con = clone_connection(con0)
 	con.begin()
 	delete = f"{datadir}/delete.{n}{ext}"
 	con.execute(f"DELETE FROM orders WHERE o_orderkey IN (SELECT column0 FROM {reader}('{delete}'))")
@@ -156,7 +194,7 @@ def timeit(fun, p):
 	return time.time() - start
 
 def refresh(ns):
-	con = con0.cursor()
+	con = clone_connection(con0)
 	for n in ns:
 		RF(con, n)
 
@@ -192,7 +230,10 @@ proceed = False
 throughput_measurement_interval = round(time.time() - start, 2)
 tpch_throughput_at_size = round((streams * 22 * 3600) / throughput_measurement_interval * scale_factor, 2)
 tpch_qphh_at_size = round((tpch_power_at_size * tpch_throughput_at_size)**(1/2), 2)
+print(f"Logged to {logfile}")
 
+print(f"tpch_power_at_size              = {tpch_power_at_size}")
 print(f"throughput_measurement_interval = {throughput_measurement_interval}")
 print(f"tpch_throughput_at_size         = {tpch_throughput_at_size}")
 print(f"tpch_qphh_at_size               = {tpch_qphh_at_size}")
+
